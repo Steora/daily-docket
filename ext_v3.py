@@ -296,6 +296,34 @@ def _google_sheets_client():
     return gspread.authorize(credentials)
 
 
+def _probe_sheet_connection_at_start() -> bool:
+    """
+    Open the target workbook and first worksheet once before Selenium runs.
+    Logs clear SUCCESS / FAILED lines for CI and local debugging.
+    """
+    logger.info("[SHEETS] Checking spreadsheet access before web extraction…")
+    try:
+        gc = _google_sheets_client()
+        sh = _open_spreadsheet(gc)
+        ws = sh.get_worksheet(0)
+        url = getattr(sh, "url", None) or (
+            f"https://docs.google.com/spreadsheets/d/{sh.id}/edit"
+        )
+        logger.info(
+            "[SHEETS] SUCCESS — connected to workbook %r | first worksheet %r | %s",
+            sh.title,
+            ws.title,
+            url,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[SHEETS] FAILED — could not open spreadsheet before extraction "
+            "(check GOOGLE_SHEET_ID / GOOGLE_SHEET_NAME, ADC/WIF, and Share with the service account)"
+        )
+        return False
+
+
 def _log_sheets_verify(
     sh: gspread.Spreadsheet,
     ws: gspread.Worksheet,
@@ -470,6 +498,8 @@ def scrape_to_dataframes(driver: webdriver.Chrome, wait: WebDriverWait) -> List[
 
 def main() -> int:
     _configure_logging()
+    if not _probe_sheet_connection_at_start():
+        return 1
     driver, wait = _build_driver()
     try:
         chunks = scrape_to_dataframes(driver, wait)
