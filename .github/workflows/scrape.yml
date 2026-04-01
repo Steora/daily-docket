@@ -14,8 +14,8 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # Prefer id (stable); set in repo Settings → Actions → Variables
-      GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+      # Set Actions **Variable** or **Secret** named GOOGLE_SHEET_ID (spreadsheet id from URL)
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID || vars.GOOGLE_SHEET_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

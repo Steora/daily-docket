@@ -20,6 +20,7 @@ from typing import List
 
 import google.auth
 import gspread
+from gspread.exceptions import SpreadsheetNotFound
 import pandas as pd
 from google.auth.transport.requests import Request
 from selenium import webdriver
@@ -81,9 +82,27 @@ def _open_spreadsheet(gc: gspread.Client):
     if _SPREADSHEET_ID_RAW:
         key = _normalize_spreadsheet_id(_SPREADSHEET_ID_RAW)
         logger.info("Opening spreadsheet by id (GOOGLE_SHEET_ID)")
-        return gc.open_by_key(key)
-    logger.info("Opening spreadsheet by title: %s", _SPREADSHEET_TITLE)
-    return gc.open(_SPREADSHEET_TITLE)
+        try:
+            return gc.open_by_key(key)
+        except SpreadsheetNotFound as exc:
+            raise RuntimeError(
+                f"Spreadsheet id {key!r} not found or the service account cannot access it. "
+                "In Google Sheets: Share → add the workflow service account email with Editor."
+            ) from exc
+    logger.warning(
+        "GOOGLE_SHEET_ID is unset — opening by title %r (often fails in CI). "
+        "Set GitHub Variable or Secret GOOGLE_SHEET_ID to the id in the sheet URL.",
+        _SPREADSHEET_TITLE,
+    )
+    try:
+        return gc.open(_SPREADSHEET_TITLE)
+    except SpreadsheetNotFound as exc:
+        raise RuntimeError(
+            f"No spreadsheet titled {_SPREADSHEET_TITLE!r} is visible to this Google identity. "
+            "Fix: (1) Set GOOGLE_SHEET_ID to the spreadsheet id from the URL, or "
+            "(2) rename the sheet to match GOOGLE_SHEET_NAME / default title, and "
+            "(3) share the sheet with the workflow service account (Editor)."
+        ) from exc
 
 GOOGLE_SCOPES = (
     "https://www.googleapis.com/auth/spreadsheets",
