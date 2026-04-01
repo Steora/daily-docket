@@ -7,6 +7,9 @@ Open the workbook by ID (recommended): set ``GOOGLE_SHEET_ID`` to the id from th
 (``.../spreadsheets/d/<ID>/edit...``) or paste the full ``docs.google.com`` link.
 
 Otherwise opens by title: ``GOOGLE_SHEET_NAME`` or the default title below.
+
+Each run writes to a worksheet tab named ``YYYY-MM-DD`` (today in UTC on the runner).
+Override the tab name with env ``GOOGLE_SHEET_TAB``. Rows append after each successful extract.
 """
 
 from __future__ import annotations
@@ -15,12 +18,13 @@ import logging
 import os
 import sys
 import time
+from datetime import date
 from io import StringIO
-from typing import List
+from typing import List, Optional
 
 import google.auth
 import gspread
-from gspread.exceptions import SpreadsheetNotFound
+from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
 import pandas as pd
 from google.auth.transport.requests import Request
 from selenium import webdriver
@@ -296,136 +300,92 @@ def _google_sheets_client():
     return gspread.authorize(credentials)
 
 
-def _probe_sheet_connection_at_start() -> bool:
+def _dated_worksheet_name() -> str:
+    """Tab title = run date (ISO). Override with GOOGLE_SHEET_TAB if set."""
+    override = os.environ.get("GOOGLE_SHEET_TAB", "").strip()
+    return override if override else date.today().isoformat()
+
+
+def _get_or_create_dated_worksheet(sh: gspread.Spreadsheet) -> gspread.Worksheet:
+    name = _dated_worksheet_name()
+    try:
+        ws = sh.worksheet(name)
+    except WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=5000, cols=40)
+        logger.info("[SHEETS] Created worksheet tab %r", name)
+    ws.clear()
+    logger.info("[SHEETS] Cleared tab %r for this run (incremental writes will follow)", name)
+    return ws
+
+
+class _IncrementalSheetWriter:
+    """Write header + rows on first chunk; append_rows for each later chunk (same columns as first)."""
+
+    def __init__(self, ws: gspread.Worksheet):
+        self.ws = ws
+        self._header: Optional[List[str]] = None
+        self.total_data_rows = 0
+
+    def append_dataframe(self, df: pd.DataFrame) -> None:
+        df2 = df.fillna("")
+        if self._header is None:
+            self._header = df2.columns.tolist()
+            rows = df2.values.tolist()
+            block = [self._header] + rows
+            self.ws.update(block, "A1", value_input_option="USER_ENTERED")
+            self.total_data_rows += len(rows)
+            logger.info(
+                "[SHEETS] First batch on tab %r: header + %s data rows",
+                self.ws.title,
+                len(rows),
+            )
+            return
+        sub = df2.reindex(columns=self._header, fill_value="")
+        rows = sub.values.tolist()
+        if not rows:
+            return
+        self.ws.append_rows(rows, value_input_option="USER_ENTERED")
+        self.total_data_rows += len(rows)
+        logger.info(
+            "[SHEETS] Appended %s rows on tab %r (total data rows so far: %s)",
+            len(rows),
+            self.ws.title,
+            self.total_data_rows,
+        )
+
+
+def _prepare_workbook_and_dated_tab() -> Optional[gspread.Worksheet]:
     """
-    Open the target workbook and first worksheet once before Selenium runs.
-    Logs clear SUCCESS / FAILED lines for CI and local debugging.
+    Open spreadsheet, get/create today's tab, clear it. Returns worksheet or None on failure.
     """
-    logger.info("[SHEETS] Checking spreadsheet access before web extraction…")
+    logger.info("[SHEETS] Connecting and preparing dated worksheet before web extraction…")
     try:
         gc = _google_sheets_client()
         sh = _open_spreadsheet(gc)
-        ws = sh.get_worksheet(0)
+        ws = _get_or_create_dated_worksheet(sh)
         url = getattr(sh, "url", None) or (
             f"https://docs.google.com/spreadsheets/d/{sh.id}/edit"
         )
         logger.info(
-            "[SHEETS] SUCCESS — connected to workbook %r | first worksheet %r | %s",
+            "[SHEETS] SUCCESS — workbook %r | data tab %r (open this tab for live updates) | %s",
             sh.title,
             ws.title,
             url,
         )
-        return True
+        return ws
     except Exception:
         logger.exception(
-            "[SHEETS] FAILED — could not open spreadsheet before extraction "
+            "[SHEETS] FAILED — could not open spreadsheet or prepare tab "
             "(check GOOGLE_SHEET_ID / GOOGLE_SHEET_NAME, ADC/WIF, and Share with the service account)"
         )
-        return False
+        return None
 
 
-def _log_sheets_verify(
-    sh: gspread.Spreadsheet,
-    ws: gspread.Worksheet,
-    header: List[str],
-    body: list[list],
-    update_result: object,
-) -> None:
-    """Common debug lines: confirm which sheet was touched and that data round-trips."""
-    url = getattr(sh, "url", None) or (
-        f"https://docs.google.com/spreadsheets/d/{sh.id}/edit"
-    )
-    nrows = len(body)
-    ncols = len(header) if header else 0
-    logger.info(
-        "[SHEETS VERIFY] Workbook: %s | worksheet: %r | wrote %s rows x %s cols (incl. header)",
-        url,
-        ws.title,
-        nrows,
-        ncols,
-    )
-    if isinstance(update_result, dict):
-        logger.info(
-            "[SHEETS VERIFY] API: updatedRows=%s updatedColumns=%s updatedCells=%s | range=%s",
-            update_result.get("updatedRows"),
-            update_result.get("updatedColumns"),
-            update_result.get("updatedCells"),
-            update_result.get("updatedRange"),
-        )
-    elif update_result is not None:
-        logger.info("[SHEETS VERIFY] API raw response: %s", update_result)
-
-    try:
-        a1 = ws.acell("A1").value
-        want_a1 = str(header[0]) if header else ""
-        got_a1 = str(a1) if a1 is not None else ""
-        if got_a1 == want_a1:
-            logger.info("[SHEETS VERIFY] Read-back OK: A1 == header[0] (%r)", got_a1[:120])
-        else:
-            logger.warning(
-                "[SHEETS VERIFY] Read-back mismatch: A1=%r vs expected header[0]=%r",
-                got_a1[:120],
-                want_a1[:120],
-            )
-        if nrows >= 1:
-            tail = ws.acell(f"A{nrows}").value
-            logger.info(
-                "[SHEETS VERIFY] Read-back sample: row %s col A = %r",
-                nrows,
-                (str(tail) if tail is not None else "")[:120],
-            )
-        _max_full_scan = 2000
-        if nrows <= _max_full_scan:
-            populated = len(ws.get_all_values())
-            if populated == nrows:
-                logger.info(
-                    "[SHEETS VERIFY] Row count OK: %s populated rows (matches upload)",
-                    populated,
-                )
-            else:
-                logger.warning(
-                    "[SHEETS VERIFY] Row count mismatch: got %s populated rows, expected %s",
-                    populated,
-                    nrows,
-                )
-        else:
-            logger.info(
-                "[SHEETS VERIFY] Skipping full-sheet row count (nrows=%s > %s); A1/tail checks above suffice",
-                nrows,
-                _max_full_scan,
-            )
-    except Exception as exc:
-        logger.warning(
-            "[SHEETS VERIFY] Read-back / row-count check failed (upload may still be OK): %s",
-            exc,
-        )
-
-
-def _upload_dataframe_to_sheet(df: pd.DataFrame) -> None:
-    logger.info("Authenticating to Google Sheets")
-    gc = _google_sheets_client()
-    sh = _open_spreadsheet(gc)
-    ws = sh.get_worksheet(0)
-    url = getattr(sh, "url", None) or (
-        f"https://docs.google.com/spreadsheets/d/{sh.id}/edit"
-    )
-    logger.info("[SHEETS VERIFY] Target workbook: %s | worksheet: %r", url, ws.title)
-
-    ws.clear()
-    df2 = df.fillna("")
-    header = df2.columns.tolist()
-    rows = df2.values.tolist()
-    if not header and not rows:
-        logger.warning("Empty dataframe; sheet cleared only")
-        logger.info("[SHEETS VERIFY] Sheet cleared; no data rows to verify")
-        return
-    body = [header] + rows
-    update_result = ws.update(body, "A1", value_input_option="USER_ENTERED")
-    _log_sheets_verify(sh, ws, header, body, update_result)
-    logger.info("Uploaded %s data rows (plus header) to first worksheet", len(rows))
-
-
-def scrape_to_dataframes(driver: webdriver.Chrome, wait: WebDriverWait) -> List[pd.DataFrame]:
+def scrape_to_dataframes(
+    driver: webdriver.Chrome,
+    wait: WebDriverWait,
+    sheet_writer: Optional[_IncrementalSheetWriter] = None,
+) -> List[pd.DataFrame]:
     master: List[pd.DataFrame] = []
     _accept_terms(driver, wait)
     _wait_form_ready(driver, wait)
@@ -459,9 +419,15 @@ def scrape_to_dataframes(driver: webdriver.Chrome, wait: WebDriverWait) -> List[
                         time.sleep(SUBMIT_SLEEP)
                         tbl = _extract_result_table(driver)
                         if tbl is not None and not tbl.empty:
-                            master.append(
-                                _append_row_context(tbl, court, city, lob, loc)
-                            )
+                            chunk = _append_row_context(tbl, court, city, lob, loc)
+                            master.append(chunk)
+                            if sheet_writer is not None:
+                                try:
+                                    sheet_writer.append_dataframe(chunk)
+                                except Exception:
+                                    logger.exception(
+                                        "[SHEETS] Incremental write failed (scraping continues)"
+                                    )
                             logger.info(
                                 "Extracted %s rows for %s / %s / %s / %s",
                                 len(tbl),
@@ -498,30 +464,43 @@ def scrape_to_dataframes(driver: webdriver.Chrome, wait: WebDriverWait) -> List[
 
 def main() -> int:
     _configure_logging()
-    if not _probe_sheet_connection_at_start():
+    ws = _prepare_workbook_and_dated_tab()
+    if ws is None:
         return 1
+    writer = _IncrementalSheetWriter(ws)
+
     driver, wait = _build_driver()
     try:
-        chunks = scrape_to_dataframes(driver, wait)
+        chunks = scrape_to_dataframes(driver, wait, sheet_writer=writer)
     finally:
         driver.quit()
 
     if not chunks:
-        logger.warning("No data collected; clearing sheet and exiting")
+        logger.warning("No data collected")
         try:
-            _upload_dataframe_to_sheet(pd.DataFrame())
+            ws.update(
+                "A1",
+                [["No data collected this run"]],
+                value_input_option="USER_ENTERED",
+            )
         except Exception:
-            logger.exception("Failed to update empty sheet")
+            logger.exception("Could not write placeholder to dated tab")
         return 1
 
-    final_df = pd.concat(chunks, ignore_index=True)
-    final_df.dropna(how="all", inplace=True)
+    logger.info(
+        "Done. Total data rows on tab %r: %s (header + rows written incrementally)",
+        ws.title,
+        writer.total_data_rows,
+    )
     try:
-        _upload_dataframe_to_sheet(final_df)
-    except Exception:
-        logger.exception("Upload failed")
-        return 1
-    logger.info("Done. Total rows: %s", len(final_df))
+        populated = len(ws.get_all_values())
+        logger.info(
+            "[SHEETS] Read-back: %s populated rows on tab %r (includes header)",
+            populated,
+            ws.title,
+        )
+    except Exception as exc:
+        logger.warning("[SHEETS] Could not read back final row count: %s", exc)
     return 0
 
 
