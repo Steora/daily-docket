@@ -8,8 +8,10 @@ Open the workbook by ID (recommended): set ``GOOGLE_SHEET_ID`` to the id from th
 
 Otherwise opens by title: ``GOOGLE_SHEET_NAME`` or the default title below.
 
-Each run writes to a worksheet tab named ``YYYY-MM-DD`` (today in UTC on the runner).
-Override the tab name with env ``GOOGLE_SHEET_TAB``. Rows append after each successful extract.
+Each calendar day uses a **separate subsheet** titled ``YYYY-MM-DD`` (runner local date;
+GitHub Actions uses UTC). The first run on a new day **creates** that tab; earlier days'
+tabs stay in the workbook. A second run the **same** day reuses and clears that day's tab.
+Override the tab title with env ``GOOGLE_SHEET_TAB``. Rows append after each successful extract.
 """
 
 from __future__ import annotations
@@ -301,20 +303,38 @@ def _google_sheets_client():
 
 
 def _dated_worksheet_name() -> str:
-    """Tab title = run date (ISO). Override with GOOGLE_SHEET_TAB if set."""
+    """
+    One subsheet name per calendar day: ``YYYY-MM-DD`` in the runner's local timezone
+    (GitHub Actions: UTC). Override with env ``GOOGLE_SHEET_TAB`` to force a fixed tab name.
+    """
     override = os.environ.get("GOOGLE_SHEET_TAB", "").strip()
     return override if override else date.today().isoformat()
 
 
 def _get_or_create_dated_worksheet(sh: gspread.Spreadsheet) -> gspread.Worksheet:
+    """
+    Ensures a worksheet exists whose title is today's date (or ``GOOGLE_SHEET_TAB``).
+
+    - **New calendar date** → that title does not exist yet → **creates a new subsheet**.
+      Older date tabs are left unchanged.
+    - **Same calendar date, another run** → tab already exists → **reuses** it, clears cells,
+      then refills (so you do not accumulate duplicate sheets for the same day).
+    """
     name = _dated_worksheet_name()
     try:
         ws = sh.worksheet(name)
+        logger.info(
+            "[SHEETS] Reusing subsheet %r (same calendar date); clearing for this run — other date tabs unchanged",
+            name,
+        )
     except WorksheetNotFound:
         ws = sh.add_worksheet(title=name, rows=5000, cols=40)
-        logger.info("[SHEETS] Created worksheet tab %r", name)
+        logger.info(
+            "[SHEETS] New subsheet %r — first run for this calendar date (previous days' tabs kept)",
+            name,
+        )
     ws.clear()
-    logger.info("[SHEETS] Cleared tab %r for this run (incremental writes will follow)", name)
+    logger.info("[SHEETS] Tab %r cleared; incremental writes will follow", name)
     return ws
 
 

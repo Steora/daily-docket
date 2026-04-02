@@ -2,8 +2,8 @@ name: Ontario Court Dates Scrape
 
 on:
   schedule:
-    # 13:00 UTC ≈ 8:00 AM Eastern (EST); adjust if you need EDT year-round
-    - cron: "0 13 * * *"
+    # 13:30 UTC = 19:00 IST (7:00 PM India Standard Time); IST has no DST
+    - cron: "30 13 * * *"
   workflow_dispatch:
 
 permissions:
